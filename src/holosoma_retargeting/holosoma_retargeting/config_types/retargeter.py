@@ -24,6 +24,26 @@ class FootLockConfig:
 
 
 @dataclass(frozen=True)
+class SelfCollisionConfig:
+    """Configuration for self-collision avoidance constraints."""
+
+    enable: bool = False
+    """Whether to enforce self-collision constraints."""
+
+    pairs: list[tuple[str, str]] = field(default_factory=list)
+    """Body name pairs to check for self-collision.
+    Example: [("left_elbow_link", "left_knee_link"), ("left_wrist_yaw_link", "left_knee_link")]"""
+
+    windows: list[tuple[int, int]] | None = None
+    """Inclusive frame windows during which self-collision is enforced.
+    If None, enforced on all frames.
+    Example: [(50, 120)] means only enforce on frames 50..120."""
+
+    tolerance: float = 0.02
+    """Minimum distance (meters) to maintain between body pairs."""
+
+
+@dataclass(frozen=True)
 class RetargeterConfig:
     """Configuration for retargeter parameters.
 
@@ -61,6 +81,9 @@ class RetargeterConfig:
 
     debug: bool = False
     """Whether to enable debug mode."""
+
+    self_collision: SelfCollisionConfig = field(default_factory=SelfCollisionConfig)
+    """Configuration for self-collision avoidance."""
 
     w_nominal_tracking_init: float = 5.0
     """Initial weight for nominal tracking cost."""

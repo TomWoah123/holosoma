@@ -16,7 +16,7 @@ from scipy.spatial.transform import Rotation  # type: ignore[import-untyped]
 from tqdm import tqdm
 from viser.extras import ViserUrdf  # type: ignore[import-not-found]
 
-from holosoma_retargeting.config_types.retargeter import FootLockConfig
+from holosoma_retargeting.config_types.retargeter import FootLockConfig, SelfCollisionConfig
 
 # Add src to path for direct execution
 src_path = Path(__file__).parent.parent / "src"
@@ -56,6 +56,7 @@ class InteractionMeshRetargeter:
         penetration_tolerance: float = 1e-3,
         foot_sticking_tolerance: float = 1e-3,
         foot_lock: FootLockConfig | None = None,
+        self_collision: SelfCollisionConfig | None = None,
         visualize: bool = False,
         debug: bool = False,
         w_nominal_tracking_init: float = 5.0,
@@ -107,6 +108,7 @@ class InteractionMeshRetargeter:
         # Tolerance for foot sticking constraints in x, y.
         self.foot_sticking_tolerance = foot_sticking_tolerance
         self._init_foot_lock(foot_lock)
+        self._self_collision_config = self_collision
 
         # Setup visualization if requested
         if self.visualize:
@@ -124,6 +126,7 @@ class InteractionMeshRetargeter:
         print("Loading robot model from: ", robot_xml_path)
 
         self.robot_data = mujoco.MjData(self.robot_model)
+        self._init_self_collision(self._self_collision_config)
 
         if self.robot_data.qpos.shape[0] > 7 + self.task_constants.ROBOT_DOF:
             self.has_dynamic_object = True
@@ -195,6 +198,47 @@ class InteractionMeshRetargeter:
                     raise ValueError(f"Invalid foot lock window with end < start for {key}: {window}")
                 normalized_windows.append((start, end))
             self._foot_lock_windows[side] = tuple(normalized_windows)
+
+    def _init_self_collision(self, self_collision: SelfCollisionConfig | None) -> None:
+        """Initialize self-collision configuration and precompute geom pairs."""
+        sc = self_collision or SelfCollisionConfig()
+        self._self_collision_enabled = sc.enable and len(sc.pairs) > 0
+        self._self_collision_tolerance = sc.tolerance
+        self._self_collision_windows: list[tuple[int, int]] | None = sc.windows
+        self._self_collision_geom_pairs: list[tuple[int, int]] = []
+
+        self._sc_last_vis_frame = -1
+
+        if not self._self_collision_enabled:
+            return
+
+        m = self.robot_model
+
+        # Build body_name → [geom_ids] mapping (only geoms with collision enabled)
+        body_to_geoms: dict[str, list[int]] = {}
+        for g in range(m.ngeom):
+            if m.geom_contype[g] == 0 and m.geom_conaffinity[g] == 0:
+                continue
+            body_id = m.geom_bodyid[g]
+            body_name = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, body_id) or ""
+            body_to_geoms.setdefault(body_name, []).append(g)
+
+        # Build geom pairs from body name pairs
+        for body_a, body_b in sc.pairs:
+            geoms_a = body_to_geoms.get(body_a, [])
+            geoms_b = body_to_geoms.get(body_b, [])
+            if not geoms_a:
+                print(f"[SelfCollision] Warning: no collision geoms found for body '{body_a}'")
+            if not geoms_b:
+                print(f"[SelfCollision] Warning: no collision geoms found for body '{body_b}'")
+            for ga in geoms_a:
+                for gb in geoms_b:
+                    self._self_collision_geom_pairs.append((ga, gb))
+
+        print(
+            f"[SelfCollision] Initialized with {len(self._self_collision_geom_pairs)} geom pairs "
+            f"from {len(sc.pairs)} body pairs, tolerance={sc.tolerance}m"
+        )
 
     def _setup_visualization(self):
         """Setup Viser visualization components."""
@@ -636,6 +680,15 @@ class InteractionMeshRetargeter:
             rhs = -phi - self.penetration_tolerance
             constraints += [Ja_n @ dqa >= rhs]
 
+        # Self-collision constraints
+        Js_sc, phis_sc = self._compute_self_collision_constraints(frame_idx)
+        for key, phi in phis_sc.items():
+            Ja_n_full = Js_sc[key]
+            Ja_n = Ja_n_full[self.q_a_indices]
+            # Enforce: new_distance >= tolerance  =>  phi + J @ dqa >= tol
+            rhs = self._self_collision_tolerance - phi
+            constraints += [Ja_n @ dqa >= rhs]
+
         # Joint limits constraints (actuated)
         if self.activate_joint_limits:
             constraints += [
@@ -709,6 +762,60 @@ class InteractionMeshRetargeter:
 
         return any(start <= frame_idx <= end for start, end in self._foot_lock_windows.get(side, ()))
 
+    def _compute_self_collision_constraints(self, frame_idx: int):
+        """Compute Jacobians and distances for self-collision body pairs.
+
+        Assumes ``mj_forward`` has already been called with the current q
+        (done by ``_update_jacobians_and_phis_from_q`` which runs first).
+
+        Returns:
+            Js: dict mapping (geom_a, geom_b) -> relative Jacobian (1 x nq)
+            phis: dict mapping (geom_a, geom_b) -> signed distance
+        """
+        if not self._self_collision_enabled:
+            return {}, {}
+
+        # Check frame windows
+        if self._self_collision_windows is not None:
+            if not any(start <= frame_idx <= end for start, end in self._self_collision_windows):
+                return {}, {}
+
+        m, d = self.robot_model, self.robot_data
+        threshold = float(self.collision_detection_threshold)
+
+        Js, phis = {}, {}
+        fromto = np.zeros(6, dtype=float)
+
+        if not hasattr(self, "_geom_names"):
+            raise RuntimeError(
+                "[SelfCollision] _geom_names not initialized. Please run _prefilter_pairs_with_mj_collision first."
+            )
+
+        _first_iter = self._sc_last_vis_frame != frame_idx
+        if _first_iter:
+            self._sc_last_vis_frame = frame_idx
+
+        for geom_a, geom_b in self._self_collision_geom_pairs:
+            fromto[:] = 0.0
+            dist = mujoco.mj_geomDistance(m, d, geom_a, geom_b, threshold, fromto)
+            if dist <= threshold:
+                J_rel = self._compute_jacobian_for_contact_relative(
+                    m.geom(geom_a),
+                    m.geom(geom_b),
+                    self._geom_names[geom_a],
+                    self._geom_names[geom_b],
+                    fromto,
+                    dist,
+                )
+                key = ("self", geom_a, geom_b)
+                Js[key] = J_rel
+                phis[key] = float(dist)
+
+        if _first_iter and self.visualize:
+            self._draw_self_collision_geoms()
+
+        return Js, phis
+
     def iterate(
         self,
         q_locked: np.ndarray,
@@ -745,6 +852,40 @@ class InteractionMeshRetargeter:
                 break
             last_cost = cost
         return q_n, cost
+
+    def _draw_self_collision_geoms(self):
+        """Draw collision cylinders for self-collision geom pairs in viser."""
+        if not hasattr(self, "server") or not self._self_collision_enabled:
+            return
+        m, d = self.robot_model, self.robot_data
+        seen_geoms: set[int] = set()
+        colors = [(255, 80, 80), (80, 80, 255)]  # red for first body, blue for second
+        for geom_a, geom_b in self._self_collision_geom_pairs:
+            for idx, gid in enumerate([geom_a, geom_b]):
+                if gid in seen_geoms:
+                    continue
+                seen_geoms.add(gid)
+                gtype = int(m.geom_type[gid])
+                if gtype not in (3, 5):  # 3 = capsule, 5 = cylinder
+                    continue
+                radius = float(m.geom_size[gid][0])
+                half_len = float(m.geom_size[gid][1])
+                cyl = trimesh.creation.capsule(radius=radius, height=2 * half_len, count=[16, 16])
+                # World transform from MuJoCo data
+                pos = d.geom_xpos[gid]
+                rot_mat = d.geom_xmat[gid].reshape(3, 3)
+                transform = np.eye(4)
+                transform[:3, :3] = rot_mat
+                transform[:3, 3] = pos
+                cyl.apply_transform(transform)
+                body_name = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, m.geom_bodyid[gid]) or ""
+                self.server.scene.add_mesh_simple(
+                    f"/world/sc_geom/{body_name}_g{gid}",
+                    vertices=cyl.vertices.astype(np.float32),
+                    faces=cyl.faces.astype(np.int32),
+                    color=colors[idx % 2],
+                    opacity=0.35,
+                )
 
     def draw_q(self, q: np.ndarray):
         """Draw a single robot configuration."""
