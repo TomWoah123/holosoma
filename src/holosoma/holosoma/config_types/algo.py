@@ -191,6 +191,16 @@ class PPOConfig:
     max_critic_learning_rate: float | None = None
     min_critic_learning_rate: float | None = None
 
+@dataclass(frozen=True)
+class FPOAlgoConfig:
+    """Configuration for FPO algorithm."""
+
+    _target_: str
+    """Target algorithm class."""
+
+    _recursive_: bool
+    """Whether to recursively instantiate."""
+
 
 @dataclass(frozen=True)
 class FastSACConfig:

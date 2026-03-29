@@ -1,0 +1,216 @@
+from holosoma.agents.base_algo.base_algo import BaseAlgo
+
+class FPO(BaseAlgo):
+    def __init__(self, env, hidden_size=512, parameterization="velocity", solver_step_size=0.1, perturb_action_std=0.0,
+                 prior_noise_std=1.0, zero_action_input=False, condition_drop_ratio=0.0, num_sampled_t=1, num_envs=4096,
+                 sample_t_strategy="uniform", p_mean=-1.2, p_std=1.2, soft_dropout=False, root_track=False, hand_track=False, **kwargs):
+        super().__init__(env, hidden_size)
+        print(f"Flow matching policy with parameterization: {parameterization}")
+        self.zero_action_input = zero_action_input
+        if self.zero_action_input:
+            print("!!! WARNING: Zeroing action input for FlowMatchingPolicy !!!")
+
+        # NOTE: Original PHC network + LayerNorm
+        self.actor_mlp = nn.Sequential(
+            # layer_init(nn.Linear(self.input_size, 2048)),
+            layer_init(nn.Linear(self.input_size+self.action_size, 2048)),
+            nn.SiLU(),
+            layer_init(nn.Linear(2048, 1536)),
+            nn.SiLU(),
+            layer_init(nn.Linear(1536, 1024)),
+            nn.SiLU(),
+            layer_init(nn.Linear(1024, 1024)),
+            nn.SiLU(),
+            layer_init(nn.Linear(1024, 512)),
+            nn.SiLU(),
+            layer_init(nn.Linear(512, hidden_size)),
+        )
+        self.actor_norm = adaLN(hidden_size)
+        self.post_adaln_non_linearity = nn.SiLU()
+        nn.init.constant_(self.actor_norm.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.actor_norm.adaLN_modulation[-1].bias, 0)
+
+        # NOTE: Original PHC network + LayerNorm
+        self.critic_mlp = nn.Sequential(
+            layer_init(nn.Linear(self.input_size, 2048)),
+            nn.SiLU(),
+            layer_init(nn.Linear(2048, 1536)),
+            nn.SiLU(),
+            layer_init(nn.Linear(1536, 1024)),
+            nn.SiLU(),
+            layer_init(nn.Linear(1024, 1024)),
+            nn.SiLU(),
+            layer_init(nn.Linear(1024, 512)),
+            nn.SiLU(),
+            layer_init(nn.Linear(512, hidden_size)),
+            nn.LayerNorm(hidden_size),
+            nn.SiLU(),
+            layer_init(nn.Linear(hidden_size, 1), std=0.01),
+        )
+
+        # Noise embedder.
+        self.noise_emb = TimestepEmbedder(hidden_size)
+
+        # Flow matching stuff.
+        self.solver = ODESolver()
+        self.path = CondOTProbPath()
+        self.parameterization = parameterization
+        self.solver_step_size = solver_step_size
+        self.perturb_action_std = torch.tensor(perturb_action_std)
+        self.prior_noise_std = torch.tensor(prior_noise_std)
+        self.condition_drop_ratio = condition_drop_ratio
+        self.relative_pose_dropout_mask = self.create_relative_pose_dropout_mask(include_action=True, root_track=root_track, hand_track=hand_track)
+        self.sample_mask = torch.bernoulli(torch.ones(num_envs, 1) * self.condition_drop_ratio) * torch.ones(num_envs, self.input_size+self.action_size)
+        self.sample_t_strategy = sample_t_strategy
+        self.p_mean = p_mean
+        self.p_std = p_std
+        self.soft_dropout = soft_dropout
+
+    def sample_noise(self, noise_shape, device):
+        noise = torch.randn(noise_shape, dtype=torch.float32, device=device)
+
+        # NOTE: scale the prior noise if using velocity parameterization
+        # if self.parameterization == "velocity":
+        noise = noise * self.prior_noise_std.to(device)
+
+        return noise
+
+    def sample_ts(self, B, device):
+        if self.sample_t_strategy == "uniform":
+            return torch.rand(B, device=device)
+        elif self.sample_t_strategy == "lognormal":
+            rnd_normal = torch.randn((B,), device=device)
+            sigma = (rnd_normal * self.p_std + self.p_mean).exp()
+            time = 1 / (1 + sigma)
+            time = torch.clip(time, min=0.0001, max=1.0)
+            return time
+
+    def sample_actions(self, obs):
+
+        assert not torch.is_grad_enabled(), "Autograd should not be enabled during the sampling chain!"
+
+        B = obs.shape[0]
+        x_0 = self.sample_noise([B, self.action_size], obs.device)
+        time_grid = torch.tensor([0.0, 1.0], device=obs.device)
+
+        if self.condition_drop_ratio > 0:
+            if self.soft_dropout:
+                self.soft_condition_mask = self.generate_soft_dropout_mask(B, obs.device, include_action=True)
+                active_condition_mask = self.soft_condition_mask
+            else:
+                condition_drop_ratio = self.relative_pose_dropout_mask.to(obs.device) # Shape [1, D_full]
+                batch_bernoulli_mask = self.sample_mask.to(obs.device)
+                active_condition_mask = batch_bernoulli_mask * condition_drop_ratio + (1 - batch_bernoulli_mask) * torch.ones_like(condition_drop_ratio) # [B or num_envs, D_full]
+        else:
+            active_condition_mask = None
+
+        def velocity_fn(x, t, obs, condition_mask=None):
+            # Remember the normed obs to use in the critic
+            obs_pointer = self.obs_norm(obs)
+            # Zero out action input if configured
+            x_eff = torch.zeros_like(x) if self.zero_action_input else x
+            # Concatenate noised action and normed obs
+            x_inp = torch.cat([x_eff, obs_pointer], dim=1)
+            # x_inp = obs_pointer
+            if condition_mask is not None:
+                x_inp = x_inp * condition_mask
+
+            # Get noise embedding for the current timestep
+            t_batch = torch.ones([B], device=obs.device) * t
+            noise_emb = self.noise_emb(t_batch * (0.0 if self.zero_action_input else 1.0))
+            hidden = self.actor_mlp(x_inp)  # Get features before adaLN
+            hidden = self.actor_norm(hidden, noise_emb)
+            hidden = self.post_adaln_non_linearity(hidden)
+
+            if self.parameterization == "velocity":
+                velocity = self.mu(hidden)
+            elif self.parameterization == "data":
+                x1 = self.mu(hidden)
+                velocity = self.path.target_to_velocity(x_1=x1, x_t=x, t=t_batch.unsqueeze(-1))
+            return velocity
+
+        x_1 = self.solver.sample(
+            velocity_fn,
+            time_grid=time_grid,
+            x_init=x_0,
+            method="euler",
+            return_intermediates=False,
+            atol=1e-5,
+            rtol=1e-5,
+            step_size=self.solver_step_size,
+            obs=obs,
+            condition_mask=active_condition_mask,
+        )
+
+        if self.perturb_action_std > 0:
+            std = self.perturb_action_std
+            std = torch.clamp(std, max=1e-6) if self._deterministic_action is True else std
+            x_1 = x_1 + torch.randn_like(x_1) * std
+
+        return x_1
+
+    def flow_matching_loss(self, actions, observations, t=None, noise=None, return_noise_t=False, sample_mask=None):
+        noise = self.sample_noise(actions.shape, actions.device) if noise is None else noise
+        t = self.sample_ts(actions.shape[0], actions.device) if t is None else t
+        path_sample = self.path.sample(t=t, x_0=noise, x_1=actions)
+        x_t = path_sample.x_t
+        u_t = path_sample.dx_t
+
+        if self.condition_drop_ratio > 0:
+            if self.soft_dropout:
+                active_condition_mask = sample_mask.to(observations.device)
+            else:
+                batch_bernoulli_mask = sample_mask.to(observations.device)
+                relative_pose_dropout_mask = self.relative_pose_dropout_mask.to(observations.device) # [1, D_full]
+                active_condition_mask = batch_bernoulli_mask * relative_pose_dropout_mask + (1 - batch_bernoulli_mask) * torch.ones_like(relative_pose_dropout_mask) # [B, D_full]
+        else:
+            active_condition_mask = None
+
+        with torch.cuda.amp.autocast():
+            # model prediction
+            obs_pointer = self.obs_norm(observations)
+            # Zero out action input if configured
+            x_t_eff = torch.zeros_like(x_t) if self.zero_action_input else x_t
+            x_inp = torch.cat([x_t_eff, obs_pointer], dim=-1)
+
+            if active_condition_mask is not None:
+                 # x_inp is [B, D_full], active_condition_mask is [B, D_full]
+                x_inp = x_inp * active_condition_mask.unsqueeze(1)
+            
+            # x_inp = obs_pointer
+            noise_emb = self.noise_emb(t * (0.0 if self.zero_action_input else 1.0))
+            hidden = self.actor_mlp(x_inp)  # Get features before adaLN
+            hidden = self.actor_norm(hidden, noise_emb.unsqueeze(1))
+            hidden = self.post_adaln_non_linearity(hidden)
+            if self.parameterization == "velocity":
+                velocity = self.mu(hidden)
+                x1 = self.path.velocity_to_target(x_t=x_t, velocity=velocity, t=t.unsqueeze(-1).unsqueeze(-1))
+                # loss  
+                log_probs = -((u_t - velocity) ** 2) / (2 * 0.05 ** 2)
+                loss = - log_probs.reshape(-1).mean()
+                # loss = torch.pow(velocity - u_t, 2).mean(-1)
+            elif self.parameterization == "data":
+                x1 = self.mu(hidden)
+                log_probs = -((x1 - actions) ** 2) / (2 * 0.05 ** 2)
+                loss = - log_probs.reshape(-1).mean()
+                # loss = torch.pow(x1 - actions, 2).mean(-1)
+
+        # (TODO) Mean bound loss
+        if self.training:
+            self.mean_bound_loss = self.bound_loss(x1)
+
+
+        if return_noise_t:
+            return log_probs.mean(-1).reshape(-1), loss, noise, t
+        else:
+            value = self.critic_mlp(obs_pointer)
+            return log_probs.mean(-1).reshape(-1), loss, value
+    
+    def forward(self, observations):
+        # Remember the normed obs to use in the critic
+        self.obs_pointer = self.obs_norm(observations)
+        # NOTE: Separate critic network takes input directly
+        value = self.critic_mlp(self.obs_pointer)
+        with torch.no_grad():
+            actions = self.sample_actions(observations)
+        return actions, value
