@@ -1,4 +1,71 @@
+import torch
+import numpy as np
+import torch.nn as nn
+from torch import Tensor
+from typing import Callable, Optional, Sequence, Union
+
+from holosoma.agents.fpo.solver import ODESolver
+from holosoma.agents.fpo.path import CondOTProbPath
 from holosoma.agents.base_algo.base_algo import BaseAlgo
+
+def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
+    """CleanRL's default layer initialization"""
+    torch.nn.init.orthogonal_(layer.weight, std)
+    torch.nn.init.constant_(layer.bias, bias_const)
+    return layer
+
+class adaLN(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 2 * hidden_size, bias=True)
+        )
+
+    def forward(self, x, c):
+        shift, scale = self.adaLN_modulation(c).chunk(2, dim=-1)
+        x = self.norm1(x) * (1+scale) + shift
+        return x
+
+class TimestepEmbedder(nn.Module):
+    """
+    Embeds scalar timesteps into vector representations.
+    """
+    def __init__(self, hidden_size, frequency_embedding_size=256):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=True),
+        )
+        self.frequency_embedding_size = frequency_embedding_size
+
+    @staticmethod
+    def timestep_embedding(t, dim, max_period=10000):
+        """
+        Create sinusoidal timestep embeddings.
+        :param t: a 1-D Tensor of N indices, one per batch element.
+                          These may be fractional.
+        :param dim: the dimension of the output.
+        :param max_period: controls the minimum frequency of the embeddings.
+        :return: an (N, D) Tensor of positional embeddings.
+        """
+        # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
+        half = dim // 2
+        freqs = torch.exp(
+            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
+        ).to(device=t.device)
+        args = t[:, None].float() * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        return embedding
+
+    def forward(self, t):
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        t_emb = self.mlp(t_freq)
+        return t_emb
 
 class FPO(BaseAlgo):
     def __init__(self, env, hidden_size=512, parameterization="velocity", solver_step_size=0.1, perturb_action_std=0.0,
@@ -74,6 +141,58 @@ class FPO(BaseAlgo):
         noise = noise * self.prior_noise_std.to(device)
 
         return noise
+    
+    def create_relative_pose_dropout_mask(self, include_action=True, root_track=False, hand_track=False):
+        # self observation dropout mask: height + num_bodies * 15 (pos + vel + rot + ang_vel) - root_pos 
+        # = 1 + 24 * 15 - 3 = 358
+        state_mask = torch.ones(1, 358)
+        left_hand_id = SMPL_MUJOCO_NAMES.index("L_Wrist")
+        right_hand_id = SMPL_MUJOCO_NAMES.index("R_Wrist")
+        assert len(SMPL_MUJOCO_NAMES) == 24, "SMPL_MUJOCO_NAMES should have 24 joints"
+
+        # imitation observation dropout mask
+        # diff_local_body_pos_flat: # 24 * 3
+        diff_local_body_pos_flat_mask = torch.zeros(1, 24 * 3)
+        diff_local_body_pos_flat_mask[:, :3] = 1 # don't drop root_pos
+        if hand_track:
+            diff_local_body_pos_flat_mask[:, left_hand_id*3:(left_hand_id+1)*3] = 1 # don't drop left_hand_pos
+            diff_local_body_pos_flat_mask[:, right_hand_id*3:(right_hand_id+1)*3] = 1 # don't drop right_hand_pos
+        # diff_local_body_rot_flat: # 24 * 6
+        diff_local_body_rot_flat_mask = torch.zeros(1, 24 * 6)
+        if not root_track and not hand_track:
+            diff_local_body_rot_flat_mask[:, :6] = 1
+        # diff_local_vel: # 24 * 3
+        diff_local_vel_mask = torch.zeros(1, 24 * 3)
+        if not root_track and not hand_track:
+            diff_local_vel_mask[:, :3] = 1
+        # diff_local_ang_vel: # 24 * 3
+        diff_local_ang_vel_mask = torch.zeros(1, 24 * 3)
+        if not root_track and not hand_track:
+            diff_local_ang_vel_mask[:, :3] = 1
+        # local_ref_body_pos: # 24 * 3
+        local_ref_body_pos_mask = torch.zeros(1, 24 * 3)
+        local_ref_body_pos_mask[:, :3] = 1
+        if hand_track:
+            local_ref_body_pos_mask[:, left_hand_id*3:(left_hand_id+1)*3] = 1
+            local_ref_body_pos_mask[:, right_hand_id*3:(right_hand_id+1)*3] = 1
+
+        # local_ref_body_rot: # 24 * 6
+        local_ref_body_rot_mask = torch.zeros(1, 24 * 6)
+        if not root_track and not hand_track:
+            local_ref_body_rot_mask[:, :6] = 1 # don't drop root_pos
+
+        if include_action:
+            # noised action dropout mask, should always be 1
+            noised_action_mask = torch.ones(1, self.action_size)
+            # concat all masks
+            relative_pose_dropout_mask = torch.cat([noised_action_mask, state_mask, diff_local_body_pos_flat_mask, diff_local_body_rot_flat_mask, diff_local_vel_mask,
+                                                        diff_local_ang_vel_mask, local_ref_body_pos_mask, local_ref_body_rot_mask], dim=-1)
+            assert relative_pose_dropout_mask.shape[-1] == self.input_size + self.action_size
+        else:
+            relative_pose_dropout_mask = torch.cat([state_mask, diff_local_body_pos_flat_mask, diff_local_body_rot_flat_mask, diff_local_vel_mask,
+                                                        diff_local_ang_vel_mask, local_ref_body_pos_mask, local_ref_body_rot_mask], dim=-1)
+            assert relative_pose_dropout_mask.shape[-1] == self.input_size
+        return relative_pose_dropout_mask
 
     def sample_ts(self, B, device):
         if self.sample_t_strategy == "uniform":
